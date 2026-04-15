@@ -4,7 +4,8 @@
 
 locals {
   # Premium SKU is required for managed rule sets (OWASP-style Default Rule Set) on the WAF policy.
-  afd_enabled = var.enable_azure_front_door && var.enable_public_nginx_ingress && local.ingress_fqdn != null
+  # Keep this driven by input variables only; count/for_each cannot depend on computed values.
+  afd_enabled = var.enable_azure_front_door && var.enable_public_nginx_ingress
 }
 
 resource "random_string" "afd_suffix" {
@@ -140,8 +141,7 @@ resource "azurerm_cdn_frontdoor_route" "frontend" {
       "application/javascript",
       "application/json",
       "application/xml",
-      "image/svg+xml",
-      "font/woff2"
+      "image/svg+xml"
     ]
   }
 

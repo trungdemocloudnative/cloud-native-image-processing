@@ -182,11 +182,6 @@ variable "enable_application_insights" {
   type        = bool
   description = "When enable_azure_monitor is true, create workspace-based Application Insights and store its connection string in Key Vault (application-insights-connection-string). Enable Helm applicationInsights.enabled to sync it into pods."
   default     = true
-
-  validation {
-    condition     = !var.enable_application_insights || var.enable_azure_monitor
-    error_message = "enable_application_insights requires enable_azure_monitor (Log Analytics workspace)."
-  }
 }
 
 variable "application_insights_name" {

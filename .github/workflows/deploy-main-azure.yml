@@ -1,40 +1,27 @@
 # Deploy CNIP to Azure AKS from the devops README flow (build/push images + Helm upgrade).
-# Triggers on pushes to `main`. Configure repository secrets (and optional variables) below.
-# Infrastructure (Terraform): use the separate manual workflow `terraform-manual.yml` so state/backends stay explicit.
 #
-# Prerequisites (same outcomes as README §1 `terraform apply` + outputs):
-# - Azure AD app registration with federated credential for GitHub Actions (OIDC), granted:
-#   - AcrPush on the container registry
-#   - Azure Kubernetes Service Cluster User Role (or Contributor) on the AKS cluster resource
-# - Populate secrets from `terraform -chdir=devops/terraform output` after a successful apply.
+# GitHub Environments (different secrets/variables per tier) — branch picks the environment name (no repo variable for this):
+#   main    → Production
+#   develop → Staging
+#   other   → Development
+# Create those exact names under Settings → Environments. Put **environment secrets** and **environment variables** on each
+# (repository-level secrets/vars are only fallbacks when an environment has no value for a name).
 #
-# AKS / kubeconfig: GitHub does not store a kubeconfig secret for this flow. Helm needs a Kubernetes API client; after Azure login,
-# `az aks get-credentials` downloads short-lived cluster credentials into the runner's default kubeconfig for that job only.
+# OIDC: federated credential on your app registration must allow the ref that runs the job (e.g. `refs/heads/main`, `refs/heads/develop`).
 #
-# Required GitHub Actions secrets:
-#   AZURE_CLIENT_ID          App registration client ID used for OIDC login
-#   AZURE_TENANT_ID          Azure AD tenant ID
-#   AZURE_SUBSCRIPTION_ID    Subscription containing RG/ACR/AKS
-#   ACR_NAME                   terraform output -raw acr_name
-#   CNIP_ACR_LOGIN_SERVER      terraform output -raw acr_login_server
-#   CNIP_PUBLIC_APP_URL      Same as README: ingress_test_http_url, cdn_frontdoor_endpoint_url (https), or your public origin for Vite
-#   AKS_RESOURCE_GROUP       terraform output -raw resource_group_name
-#   AKS_CLUSTER_NAME         terraform output -raw aks_name
-#   KEY_VAULT_NAME           terraform output -raw key_vault_name
-#   WORKLOAD_IDENTITY_CLIENT_ID  terraform output -raw workload_identity_client_id
+# Prerequisites (README §1): Azure AD app with AcrPush + AKS get-credentials access; populate **environment** secrets from Terraform output.
 #
-# Optional repository variables:
-#   K8S_NAMESPACE                     Default: cnip (must match Terraform kubernetes_namespace)
-#   HELM_APPLICATION_INSIGHTS_ENABLED Set to "false" if Terraform has enable_application_insights = false
+# Typical environment secrets: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, ACR_NAME, CNIP_ACR_LOGIN_SERVER,
+# CNIP_PUBLIC_APP_URL, AKS_RESOURCE_GROUP, AKS_CLUSTER_NAME, KEY_VAULT_NAME, WORKLOAD_IDENTITY_CLIENT_ID.
+# Typical environment variables: K8S_NAMESPACE (optional, default cnip), HELM_APPLICATION_INSIGHTS_ENABLED (optional).
+# Optional mode: set environment variable USE_TERRAFORM_OUTPUTS=true to read deploy values from Terraform remote state outputs
+# (requires TF_STATE_* secrets and TERRAFORM_USE_REMOTE_STATE=true on that environment).
 #
-# Optional workflow_dispatch inputs let you override image tag or skip image build (Helm only).
+# Infrastructure: use `terraform-manual.yml` (same branch → environment mapping).
 
-name: Deploy to Azure (main)
+name: Deploy to Azure
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       image_tag:
@@ -55,13 +42,29 @@ env:
   HELM_RELEASE_NAME: cnip
   HELM_CHART_PATH: ./devops/helm/cloud-native-image-processing
   HELM_VALUES_FILE: ./devops/helm/cloud-native-image-processing/values.yaml
+  # Branch-only routing (must match environment.name below — GitHub does not allow env.* in jobs.*.environment.name).
+  TARGET_GITHUB_ENVIRONMENT: ${{ github.ref_name == 'main' && 'Production' || (github.ref_name == 'develop' && 'Staging' || 'Development') }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.ref_name == 'main' && 'Production' || (github.ref_name == 'develop' && 'Staging' || 'Development') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Deployment context
+        run: |
+          echo "target_github_environment=${TARGET_GITHUB_ENVIRONMENT}"
+          echo "github_ref_name=${{ github.ref_name }}"
+          echo "github_repository=${{ github.repository }}"
+          echo "github_ref=${{ github.ref }}"
+          echo "github_sha=${{ github.sha }}"
+          echo "github_event_name=${{ github.event_name }}"
+          echo "github_actor=${{ github.actor }}"
+          echo "github_run_id=${{ github.run_id }}"
+          echo "github_run_attempt=${{ github.run_attempt }}"
 
       - name: Azure login (OIDC)
         uses: azure/login@v2
@@ -79,14 +82,86 @@ jobs:
             echo "tag=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Setup Terraform (read outputs)
+        if: ${{ vars.USE_TERRAFORM_OUTPUTS == 'true' }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+          terraform_wrapper: false
+
+      - name: Resolve deploy values from Terraform outputs
+        if: ${{ vars.USE_TERRAFORM_OUTPUTS == 'true' }}
+        env:
+          TF_STATE_RG: ${{ secrets.TF_STATE_RESOURCE_GROUP }}
+          TF_STATE_SA: ${{ secrets.TF_STATE_STORAGE_ACCOUNT }}
+          TF_STATE_CONTAINER: ${{ secrets.TF_STATE_CONTAINER }}
+          TF_STATE_KEY: ${{ secrets.TF_STATE_KEY }}
+        run: |
+          set -euo pipefail
+          tf_output_raw() {
+            terraform -chdir=devops/terraform output -raw "$1" 2>/dev/null || true
+          }
+          first_valid_http_url() {
+            for candidate in "$@"; do
+              if [[ "$candidate" =~ ^https?://[^[:space:]]+$ ]]; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+            return 1
+          }
+          [ "${{ vars.TERRAFORM_USE_REMOTE_STATE }}" = "true" ] || { echo "Set TERRAFORM_USE_REMOTE_STATE=true for this environment."; exit 1; }
+          test -n "${TF_STATE_RG}" || { echo "Missing TF_STATE_RESOURCE_GROUP secret"; exit 1; }
+          test -n "${TF_STATE_SA}" || { echo "Missing TF_STATE_STORAGE_ACCOUNT secret"; exit 1; }
+          test -n "${TF_STATE_CONTAINER}" || { echo "Missing TF_STATE_CONTAINER secret"; exit 1; }
+          test -n "${TF_STATE_KEY}" || { echo "Missing TF_STATE_KEY secret"; exit 1; }
+          cat > devops/terraform/backend.ci.tf <<'EOF'
+          terraform {
+            backend "azurerm" {}
+          }
+          EOF
+          terraform -chdir=devops/terraform init -input=false -no-color \
+            -backend-config="resource_group_name=${TF_STATE_RG}" \
+            -backend-config="storage_account_name=${TF_STATE_SA}" \
+            -backend-config="container_name=${TF_STATE_CONTAINER}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
+            -backend-config="tenant_id=${{ secrets.AZURE_TENANT_ID }}" \
+            -backend-config="use_oidc=true" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="client_id=${{ secrets.AZURE_CLIENT_ID }}"
+          ACR_NAME="$(tf_output_raw acr_name)"
+          CNIP_ACR_LOGIN_SERVER="$(tf_output_raw acr_login_server)"
+          AKS_RESOURCE_GROUP="$(tf_output_raw resource_group_name)"
+          AKS_CLUSTER_NAME="$(tf_output_raw aks_name)"
+          KEY_VAULT_NAME="$(tf_output_raw key_vault_name)"
+          WORKLOAD_IDENTITY_CLIENT_ID="$(tf_output_raw workload_identity_client_id)"
+          CNIP_PUBLIC_APP_URL="$(
+            first_valid_http_url \
+              "$(tf_output_raw cdn_frontdoor_endpoint_url)" \
+              "$(tf_output_raw ingress_test_http_url)" \
+              "$(tf_output_raw cnip_public_app_url_http_ip)" \
+            || true
+          )"
+          CNIP_PUBLIC_APP_URL="${CNIP_PUBLIC_APP_URL:-http://localhost:8080}"
+          {
+            echo "ACR_NAME=${ACR_NAME}"
+            echo "CNIP_ACR_LOGIN_SERVER=${CNIP_ACR_LOGIN_SERVER}"
+            echo "AKS_RESOURCE_GROUP=${AKS_RESOURCE_GROUP}"
+            echo "AKS_CLUSTER_NAME=${AKS_CLUSTER_NAME}"
+            echo "KEY_VAULT_NAME=${KEY_VAULT_NAME}"
+            echo "WORKLOAD_IDENTITY_CLIENT_ID=${WORKLOAD_IDENTITY_CLIENT_ID}"
+            echo "CNIP_PUBLIC_APP_URL=${CNIP_PUBLIC_APP_URL}"
+          } >> "${GITHUB_ENV}"
+
       - name: ACR login
-        run: az acr login -n "${{ secrets.ACR_NAME }}"
+        run: az acr login -n "${ACR_NAME:-${{ secrets.ACR_NAME }}}"
 
       - name: Build and push images
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_build == true) }}
         env:
-          CNIP_ACR_LOGIN_SERVER: ${{ secrets.CNIP_ACR_LOGIN_SERVER }}
-          CNIP_PUBLIC_APP_URL: ${{ secrets.CNIP_PUBLIC_APP_URL }}
+          CNIP_ACR_LOGIN_SERVER: ${{ env.CNIP_ACR_LOGIN_SERVER || secrets.CNIP_ACR_LOGIN_SERVER }}
+          CNIP_PUBLIC_APP_URL: ${{ env.CNIP_PUBLIC_APP_URL || secrets.CNIP_PUBLIC_APP_URL }}
           CNIP_IMAGE_TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
@@ -96,8 +171,8 @@ jobs:
       - name: Configure kubectl for AKS (Helm)
         run: |
           az aks get-credentials \
-            --resource-group "${{ secrets.AKS_RESOURCE_GROUP }}" \
-            --name "${{ secrets.AKS_CLUSTER_NAME }}" \
+            --resource-group "${AKS_RESOURCE_GROUP:-${{ secrets.AKS_RESOURCE_GROUP }}}" \
+            --name "${AKS_CLUSTER_NAME:-${{ secrets.AKS_CLUSTER_NAME }}}" \
             --overwrite-existing
 
       - name: Install Helm
@@ -117,7 +192,6 @@ jobs:
           else
             AI_ENABLED=true
           fi
-          # Align chart image tags with what we just pushed
           helm upgrade --install "${{ env.HELM_RELEASE_NAME }}" "${{ env.HELM_CHART_PATH }}" \
             --namespace "$NS" \
             --create-namespace \
@@ -129,7 +203,7 @@ jobs:
             --set-string frontend.image.tag="${CNIP_IMAGE_TAG}" \
             --set keyVault.enabled=true \
             --set applicationInsights.enabled="${AI_ENABLED}" \
-            --set-string acrLoginServer="${{ secrets.CNIP_ACR_LOGIN_SERVER }}" \
+            --set-string acrLoginServer="${CNIP_ACR_LOGIN_SERVER:-${{ secrets.CNIP_ACR_LOGIN_SERVER }}}" \
             --set-string keyVault.tenantId="${{ secrets.AZURE_TENANT_ID }}" \
-            --set-string keyVault.vaultName="${{ secrets.KEY_VAULT_NAME }}" \
-            --set-string keyVault.workloadIdentityClientId="${{ secrets.WORKLOAD_IDENTITY_CLIENT_ID }}"
+            --set-string keyVault.vaultName="${KEY_VAULT_NAME:-${{ secrets.KEY_VAULT_NAME }}}" \
+            --set-string keyVault.workloadIdentityClientId="${WORKLOAD_IDENTITY_CLIENT_ID:-${{ secrets.WORKLOAD_IDENTITY_CLIENT_ID }}}"

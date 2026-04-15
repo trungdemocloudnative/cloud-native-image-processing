@@ -10,8 +10,9 @@ data "azurerm_resources" "aks_node_nsgs" {
 }
 
 locals {
-  aks_node_nsg_names = var.aks_subnet_lb_inbound_nsg_hardening && length(data.azurerm_resources.aks_node_nsgs[0].resources) > 0 ? sort([
-    for r in data.azurerm_resources.aks_node_nsgs[0].resources : r.name
+  aks_node_nsg_resources = var.aks_subnet_lb_inbound_nsg_hardening ? try(data.azurerm_resources.aks_node_nsgs[0].resources, []) : []
+  aks_node_nsg_names = length(local.aks_node_nsg_resources) > 0 ? sort([
+    for r in local.aks_node_nsg_resources : r.name
   ]) : []
   # Prefer the agent pool NSG name when multiple NSGs exist in the node RG.
   aks_node_nsg_name = length(local.aks_node_nsg_names) == 0 ? null : try(

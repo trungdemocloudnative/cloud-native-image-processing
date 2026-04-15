@@ -100,12 +100,11 @@ resource "azurerm_key_vault_secret" "computer_vision_api_key" {
 }
 
 resource "azurerm_federated_identity_credential" "cnip_workload" {
-  name                = "${var.prefix}-fed-cnip-workload"
-  resource_group_name = azurerm_resource_group.main.name
-  parent_id           = azurerm_user_assigned_identity.workload.id
-  audience            = ["api://AzureADTokenExchange"]
-  issuer              = azurerm_kubernetes_cluster.main.oidc_issuer_url
-  subject             = "system:serviceaccount:${var.kubernetes_namespace}:${var.workload_service_account_name}"
+  name      = "${var.prefix}-fed-cnip-workload"
+  parent_id = azurerm_user_assigned_identity.workload.id
+  audience  = ["api://AzureADTokenExchange"]
+  issuer    = azurerm_kubernetes_cluster.main.oidc_issuer_url
+  subject   = "system:serviceaccount:${var.kubernetes_namespace}:${var.workload_service_account_name}"
 
   depends_on = [
     azurerm_kubernetes_cluster.main,

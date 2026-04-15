@@ -1,27 +1,25 @@
-# Manual Terraform plan/apply for devops/terraform (separate from image deploy on main).
+# Manual Terraform plan/apply for devops/terraform.
 #
-# Why not merge into deploy-main-azure.yml?
-# - Infra changes are rarer and higher risk; manual dispatch + explicit confirmation is safer.
-# - Terraform needs the same Azure OIDC identity to have RBAC to create/update resources (often Owner/Contributor on the RG).
+# GitHub Environments — branch picks the environment name (no repository variable for routing):
+#   main    → Production
+#   develop → Staging
+#   other   → Development
+# Configure **environment secrets** and **environment variables** on each (Settings → Environments → <name>).
 #
-# Remote state (required for meaningful CI plan/apply):
-# - Local default in this repo is no remote backend (see devops/README.md). CI runners start with an empty disk, so apply without
-#   remote state would create parallel infrastructure. When repository variable TERRAFORM_USE_REMOTE_STATE is "true", this workflow
-#   writes a CI-only backend block and runs terraform init with an Azure Storage backend (OIDC).
-# - Create the storage account + container once, then set the secrets below.
+# Remote state: set environment variable TERRAFORM_USE_REMOTE_STATE=true on each environment that runs CI apply, after
+# configuring the Azure Storage backend; set TF_STATE_* environment secrets there too.
+# Optional environment variable for bootstrap creation:
+# - TF_STATE_LOCATION (default: southeastasia) used only when creating the state storage account if missing.
 #
-# Required secrets (same app registration can be used as deploy workflow if it has both AKS/ACR and Terraform RBAC):
-#   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
-#   TERRAFORM_TFVARS   Multiline: full contents of terraform.tfvars (same as you would use locally after cp terraform.tfvars.example)
+# Required environment secrets (when that environment runs this workflow): AZURE_CLIENT_ID, AZURE_TENANT_ID,
+# AZURE_SUBSCRIPTION_ID, TERRAFORM_TFVARS. When TERRAFORM_USE_REMOTE_STATE is true: TF_STATE_RESOURCE_GROUP,
+# TF_STATE_STORAGE_ACCOUNT, TF_STATE_CONTAINER, TF_STATE_KEY.
+# Required RBAC on the Terraform state storage account/container for the OIDC principal:
+# - Storage Blob Data Contributor (recommended, via use_azuread_auth=true in backend init below)
 #
-# When vars.TERRAFORM_USE_REMOTE_STATE == "true", also required:
-#   TF_STATE_RESOURCE_GROUP   Resource group containing the Terraform state storage account
-#   TF_STATE_STORAGE_ACCOUNT  Storage account name (for azurerm backend)
-#   TF_STATE_CONTAINER        Blob container name (e.g. tfstate)
-#   TF_STATE_KEY              State blob key (e.g. cnip.terraform.tfstate)
-#
-# Repository variable:
-#   TERRAFORM_USE_REMOTE_STATE  Set to "true" after Azure Storage backend exists and secrets above are set.
+# Authentication: ARM_USE_OIDC (same pattern as deploy).
+
+# Reference: https://learn.microsoft.com/en-us/devops/deliver/iac-github-actions
 
 name: Terraform (manual)
 
@@ -40,14 +38,25 @@ on:
         type: string
         required: false
         default: ""
+      bootstrap_state:
+        description: "Bootstrap tfstate backend (resource group/storage account/container) before init"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   id-token: write
   contents: read
 
+env:
+  # Must match environment.name below — GitHub does not allow env.* in jobs.*.environment.name.
+  TARGET_GITHUB_ENVIRONMENT: ${{ github.ref_name == 'main' && 'Production' || (github.ref_name == 'develop' && 'Staging' || 'Development') }}
+
 jobs:
   terraform:
     runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.ref_name == 'main' && 'Production' || (github.ref_name == 'develop' && 'Staging' || 'Development') }}
     defaults:
       run:
         working-directory: devops/terraform
@@ -60,6 +69,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Azure login (backend bootstrap)
+        if: ${{ vars.TERRAFORM_USE_REMOTE_STATE == 'true' }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform workflow context
+        run: |
+          echo "target_github_environment=${TARGET_GITHUB_ENVIRONMENT}"
+          echo "github_ref_name=${{ github.ref_name }}"
+          echo "terraform_action=${{ inputs.action }}"
+          echo "bootstrap_state=${{ inputs.bootstrap_state }}"
+          echo "github_repository=${{ github.repository }}"
+          echo "github_ref=${{ github.ref }}"
+          echo "github_sha=${{ github.sha }}"
+          echo "github_event_name=${{ github.event_name }}"
+          echo "github_actor=${{ github.actor }}"
+          echo "github_run_id=${{ github.run_id }}"
+          echo "github_run_attempt=${{ github.run_attempt }}"
+
       - name: Confirm apply
         if: ${{ inputs.action == 'apply' && inputs.confirmation != 'apply' }}
         run: |
@@ -69,7 +100,7 @@ jobs:
       - name: Require remote state for CI Terraform
         if: ${{ vars.TERRAFORM_USE_REMOTE_STATE != 'true' }}
         run: |
-          echo "Set repository variable TERRAFORM_USE_REMOTE_STATE to true after configuring an Azure Storage backend and TF_STATE_* secrets."
+          echo "On GitHub Environment \"${TARGET_GITHUB_ENVIRONMENT}\", set variable TERRAFORM_USE_REMOTE_STATE=true (Environment variables) after configuring Azure Storage and TF_STATE_* secrets."
           echo "Without remote state, CI would use an empty local state file and risk duplicating infrastructure."
           exit 1
 
@@ -81,10 +112,60 @@ jobs:
           TF_STATE_KEY: ${{ secrets.TF_STATE_KEY }}
         run: |
           set -euo pipefail
-          test -n "${TF_STATE_RG}" || (echo "Missing secret TF_STATE_RESOURCE_GROUP"; exit 1)
-          test -n "${TF_STATE_SA}" || (echo "Missing secret TF_STATE_STORAGE_ACCOUNT"; exit 1)
-          test -n "${TF_STATE_CONTAINER}" || (echo "Missing secret TF_STATE_CONTAINER"; exit 1)
-          test -n "${TF_STATE_KEY}" || (echo "Missing secret TF_STATE_KEY"; exit 1)
+          test -n "${TF_STATE_RG}" || (echo "Missing environment secret TF_STATE_RESOURCE_GROUP"; exit 1)
+          test -n "${TF_STATE_SA}" || (echo "Missing environment secret TF_STATE_STORAGE_ACCOUNT"; exit 1)
+          test -n "${TF_STATE_CONTAINER}" || (echo "Missing environment secret TF_STATE_CONTAINER"; exit 1)
+          test -n "${TF_STATE_KEY}" || (echo "Missing environment secret TF_STATE_KEY"; exit 1)
+
+      - name: Ensure Terraform state resource group exists
+        if: ${{ vars.TERRAFORM_USE_REMOTE_STATE == 'true' && inputs.bootstrap_state }}
+        env:
+          TF_STATE_RG: ${{ secrets.TF_STATE_RESOURCE_GROUP }}
+          TF_STATE_LOCATION: ${{ vars.TF_STATE_LOCATION || 'southeastasia' }}
+        run: |
+          set -euo pipefail
+          az group create \
+            --name "${TF_STATE_RG}" \
+            --location "${TF_STATE_LOCATION}" \
+            --output none
+
+      - name: Ensure Terraform state storage account exists (LRS minimal)
+        if: ${{ vars.TERRAFORM_USE_REMOTE_STATE == 'true' && inputs.bootstrap_state }}
+        env:
+          TF_STATE_RG: ${{ secrets.TF_STATE_RESOURCE_GROUP }}
+          TF_STATE_SA: ${{ secrets.TF_STATE_STORAGE_ACCOUNT }}
+          TF_STATE_LOCATION: ${{ vars.TF_STATE_LOCATION || 'southeastasia' }}
+        run: |
+          set -euo pipefail
+          az storage account create \
+            --name "${TF_STATE_SA}" \
+            --resource-group "${TF_STATE_RG}" \
+            --location "${TF_STATE_LOCATION}" \
+            --sku Standard_LRS \
+            --kind StorageV2 \
+            --min-tls-version TLS1_2 \
+            --https-only true \
+            --allow-blob-public-access false \
+            --output none
+
+      - name: Ensure Terraform state blob container exists
+        if: ${{ vars.TERRAFORM_USE_REMOTE_STATE == 'true' && inputs.bootstrap_state }}
+        env:
+          TF_STATE_SA: ${{ secrets.TF_STATE_STORAGE_ACCOUNT }}
+          TF_STATE_CONTAINER: ${{ secrets.TF_STATE_CONTAINER }}
+        run: |
+          set -euo pipefail
+          if [ "$(az storage container exists \
+            --name "${TF_STATE_CONTAINER}" \
+            --account-name "${TF_STATE_SA}" \
+            --auth-mode login \
+            --query exists -o tsv)" != "true" ]; then
+            az storage container create \
+              --name "${TF_STATE_CONTAINER}" \
+              --account-name "${TF_STATE_SA}" \
+              --auth-mode login \
+              --output none
+          fi
 
       - name: Write terraform.tfvars from secret
         env:
@@ -92,7 +173,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${TERRAFORM_TFVARS}" ]; then
-            echo "Set repository secret TERRAFORM_TFVARS to the full contents of your terraform.tfvars file."
+            echo "Set environment secret TERRAFORM_TFVARS on \"${TARGET_GITHUB_ENVIRONMENT}\" (or repository fallback)."
             exit 1
           fi
           python3 - <<'PY'
@@ -131,6 +212,7 @@ jobs:
             -backend-config="subscription_id=${ARM_SUBSCRIPTION_ID}" \
             -backend-config="tenant_id=${ARM_TENANT_ID}" \
             -backend-config="use_oidc=true" \
+            -backend-config="use_azuread_auth=true" \
             -backend-config="client_id=${ARM_CLIENT_ID}"
 
       - name: Terraform validate
